@@ -13,7 +13,7 @@ use chunk_source::{
     ChunkSource, ChunkSourceBuilder, LocalChunkSource, open_local_file, prepare_remote_chunk_source,
 };
 use common_error::DaftResult;
-use common_runtime::{JoinSet, get_compute_runtime};
+use common_runtime::{JoinSet, get_compute_pool_num_threads, get_compute_runtime};
 use daft_core::prelude::*;
 use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, optimization::get_required_columns};
 use daft_recordbatch::RecordBatch;
@@ -479,10 +479,44 @@ pub(super) struct RgTaskCtx {
     pub(super) chunk_size: usize,
 }
 
+/// Max row groups concurrently holding fetched bytes + in decode. Bounds a
+/// scan task's resident memory to O(window × RG compressed size) instead of
+/// O(file). `DAFT_PARQUET_PREFETCH_RG_WINDOW`: unset → max(2, compute
+/// threads); `0` → unbounded (pre-window behavior); `N` → N.
+///
+/// Default rationale: RG decode tasks share the compute pool, so more than
+/// one in-flight RG per thread buys no decode parallelism — it only holds
+/// extra fetched bytes. Measured on the OOM repro (12 × ~39MB RGs, 4
+/// threads): window 8 barely moved peak RSS, window 4 cut the Ray worker
+/// total peak ~40% with no elapsed-time cost.
+fn prefetch_rg_window(num_rgs: usize) -> usize {
+    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let w = *WINDOW.get_or_init(|| {
+        match std::env::var("DAFT_PARQUET_PREFETCH_RG_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => get_compute_pool_num_threads().max(2),
+        }
+    });
+    w.min(num_rgs.max(1))
+}
+
 /// One bounded channel per RG, drained in RG order. In-file output is always
 /// RG-ordered: `maintain_order=false` at the scan layer only reorders BETWEEN
 /// scan tasks; downstream code (and tests) expect file-order output within
 /// a single file.
+///
+/// RG tasks are admitted through a sliding window of size
+/// [`prefetch_rg_window`]: entering the window starts the RG's byte fetches
+/// (`prefetch_rg`), finishing decode releases them (`release_rg`) and admits
+/// RG `i + window`. Admission MUST be in RG order — the output stream drains
+/// RG 0 first, so admitting later RGs ahead of earlier ones would park the
+/// whole window on full channels and deadlock. A per-RG `Notify` chain
+/// guarantees that ordering (a fair semaphore does not: waiter order follows
+/// first poll, which the runtime does not schedule in spawn order).
 fn build_rg_stream(
     ctx: Arc<RgTaskCtx>,
     rg_indices: Vec<usize>,
@@ -495,23 +529,51 @@ fn build_rg_stream(
         .map(|_| tokio::sync::mpsc::channel::<DaftResult<RecordBatch>>(1))
         .unzip();
 
+    let num_rgs = rg_inputs.len();
+    let window = prefetch_rg_window(num_rgs);
+    let gates: Arc<Vec<tokio::sync::Notify>> =
+        Arc::new((0..num_rgs).map(|_| tokio::sync::Notify::new()).collect());
+    // Pre-admit the first `window` RGs. `notify_one` stores a permit, so it
+    // is safe to fire before the task awaits `notified()`.
+    for gate in gates.iter().take(window) {
+        gate.notify_one();
+    }
+
     let compute = get_compute_runtime();
     let mut joinset: JoinSet<DaftResult<()>> = JoinSet::new();
     for (rg_pos, (sender, inputs)) in senders.into_iter().zip(rg_inputs).enumerate() {
         let ctx = ctx.clone();
         let rg_idx = rg_indices[rg_pos];
+        let gates = gates.clone();
         joinset.spawn_on(
             async move {
+                gates[rg_pos].notified().await;
+                ctx.chunk_source.prefetch_rg(rg_idx).await;
                 let mut sub_stream = if ctx.plan.data_col_indices.is_empty() {
                     process_rg_predicate_only(ctx.clone(), rg_idx, inputs.selection).await
                 } else {
-                    process_rg_with_data_cols(ctx, rg_idx, inputs.selection, inputs.pred_arrays)
-                        .await
+                    process_rg_with_data_cols(
+                        ctx.clone(),
+                        rg_idx,
+                        inputs.selection,
+                        inputs.pred_arrays,
+                    )
+                    .await
                 };
                 while let Some(item) = sub_stream.next().await {
                     if sender.send(item).await.is_err() {
                         break;
                     }
+                }
+                // This RG is done (drained or receiver gone) — drop its cached
+                // fetch bytes so resident memory tracks in-flight RGs, not the
+                // whole file. Must happen after `sub_stream` is dropped: the
+                // decoder inside it holds `OffsetBytes` slices of those bytes.
+                drop(sub_stream);
+                ctx.chunk_source.release_rg(rg_idx).await;
+                // Slide the window: admit RG `rg_pos + window`.
+                if let Some(gate) = gates.get(rg_pos + window) {
+                    gate.notify_one();
                 }
                 DaftResult::Ok(())
             },

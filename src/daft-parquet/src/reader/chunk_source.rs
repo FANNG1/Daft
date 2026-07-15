@@ -39,32 +39,6 @@ fn coalesce_ranges(mut leaf_ranges: Vec<LeafRange>, max_gap: u64) -> Vec<RangeGr
     groups
 }
 
-async fn drive_group(slot: &GroupSlot, path: &str) -> GroupResult {
-    let mut guard = slot.state.lock().await;
-    if let RangeState::Ready(r) = &*guard {
-        return r.clone();
-    }
-    // Drive InFlight → Ready. Holding the lock across `.await` serializes
-    // concurrent waiters, but they'd have had to wait for the same spawned
-    // task to finish either way — no extra latency.
-    //
-    // `Pin::new(task).await` polls the task to completion without consuming
-    // it (RuntimeTask is Unpin), so the borrow ends with the inner block and
-    // we can then write the Ready result back through the same guard.
-    let res: GroupResult = {
-        let RangeState::InFlight(task) = &mut *guard else {
-            unreachable!("Ready branch returned above")
-        };
-        match Pin::new(task).await {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(e)) => Err(Arc::new(e)),
-            Err(daft_err) => Err(Arc::new(task_err(path.to_string())(daft_err))),
-        }
-    };
-    *guard = RangeState::Ready(res.clone());
-    res
-}
-
 pub(super) async fn open_local_file(
     path: &str,
 ) -> crate::Result<(Arc<std::fs::File>, u64, ArrowReaderMetadata)> {
@@ -331,6 +305,35 @@ impl ChunkSource {
     ///   leaves and awaits only the coalesced byte-range groups covering them,
     ///   so fast columns start streaming while slower groups are still in
     ///   flight.
+    /// Kick off background fetches for a row group entering the decode
+    /// window. No-op for `Local` (local reads are per-call syscalls, nothing
+    /// to prefetch).
+    pub(super) async fn prefetch_rg(&self, rg_idx: usize) {
+        if let Self::Remote(s) = self {
+            s.prefetch_rg(rg_idx).await;
+        }
+    }
+
+    /// Release a row group's cached fetch bytes once its decode stream is
+    /// fully drained. No-op for `Local` (local reads don't cache), and no-op
+    /// when disabled via `DAFT_PARQUET_RELEASE_RG_BYTES=0` (escape hatch /
+    /// A-B testing knob).
+    pub(super) async fn release_rg(&self, rg_idx: usize) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            !matches!(
+                std::env::var("DAFT_PARQUET_RELEASE_RG_BYTES").as_deref(),
+                Ok("0") | Ok("false")
+            )
+        });
+        if !enabled {
+            return;
+        }
+        if let Self::Remote(s) = self {
+            s.release_rg(rg_idx).await;
+        }
+    }
+
     pub(super) async fn open_rg(
         self: Arc<Self>,
         rg_idx: usize,
@@ -479,13 +482,21 @@ impl LocalChunkSource {
 type SharedErr = Arc<crate::Error>;
 type GroupResult = Result<Bytes, SharedErr>;
 
-/// Per-coalesced-byte-range fetch state. Starts as `InFlight(task)`; the
-/// first awaiter drives the spawned task to completion and stores the
-/// (cloneable) result in `Ready`. Subsequent awaiters clone the cached
-/// bytes/error instead of re-fetching.
+/// Per-coalesced-byte-range fetch state. Starts as `Pending` (byte range
+/// recorded, nothing fetched); the fetch is spawned either by `prefetch_rg`
+/// when the row group enters the decode window, or lazily by the first
+/// reader. The first awaiter drives the spawned task to completion and
+/// stores the (cloneable) result in `Ready`. Subsequent awaiters clone the
+/// cached bytes/error instead of re-fetching.
 enum RangeState {
+    /// Not fetched yet: absolute file byte range to GET when needed.
+    Pending(std::ops::Range<usize>),
     InFlight(RuntimeTask<crate::Result<Bytes>>),
     Ready(GroupResult),
+    /// Bytes dropped after the RG finished decoding (see `release_rg`).
+    /// Reading a released group is a logic error — decode order guarantees
+    /// release happens only after the RG's stream is fully drained.
+    Released,
 }
 
 /// One coalesced byte-range within a row group: the absolute file offset its
@@ -521,6 +532,11 @@ pub(crate) struct RemoteChunkSource {
     path: Arc<str>,
     rgs: HashMap<usize, RgState>,
     file_len: u64,
+    // Fetch context, kept so `Pending` slots can spawn their GET on demand
+    // (lazily at first read, or in bulk when the RG enters the decode window).
+    io_client: Arc<daft_io::IOClient>,
+    io_stats: Option<daft_io::IOStatsRef>,
+    uri: String,
 }
 
 impl RemoteChunkSource {
@@ -540,7 +556,6 @@ impl RemoteChunkSource {
         uri: String,
     ) -> Self {
         let file_len = file_size as u64;
-        let io_runtime = get_io_runtime(true);
         let mut rgs = HashMap::with_capacity(active_rg_indices.len());
 
         for &rg_idx in active_rg_indices {
@@ -569,24 +584,13 @@ impl RemoteChunkSource {
                 },
             ) in groups.into_iter().enumerate()
             {
-                let io_client = io_client.clone();
-                let io_stats = io_stats.clone();
-                let uri = uri.clone();
+                // No fetch yet: record the byte range only. The GET is
+                // spawned by `prefetch_rg` when this RG enters the decode
+                // window, or lazily by the first reader (`drive_group`).
                 let range = group_start as usize..group_end as usize;
-                let task = io_runtime.spawn(async move {
-                    let get_result = io_client
-                        .single_url_get(
-                            uri,
-                            Some(daft_io::range::GetRange::Bounded(range)),
-                            io_stats,
-                        )
-                        .await?;
-                    let bytes = get_result.bytes().await?;
-                    crate::Result::Ok(bytes)
-                });
                 group_slots.push(GroupSlot {
                     group_start,
-                    state: tokio::sync::Mutex::new(RangeState::InFlight(task)),
+                    state: tokio::sync::Mutex::new(RangeState::Pending(range)),
                 });
                 for LeafRange { leaf, start, len } in members {
                     leaves.insert(
@@ -613,6 +617,79 @@ impl RemoteChunkSource {
             path,
             rgs,
             file_len,
+            io_client,
+            io_stats,
+            uri,
+        }
+    }
+
+    /// Spawn the byte-range GET for one coalesced group on the IO runtime.
+    fn spawn_fetch(&self, range: std::ops::Range<usize>) -> RuntimeTask<crate::Result<Bytes>> {
+        let io_client = self.io_client.clone();
+        let io_stats = self.io_stats.clone();
+        let uri = self.uri.clone();
+        get_io_runtime(true).spawn(async move {
+            let get_result = io_client
+                .single_url_get(uri, Some(daft_io::range::GetRange::Bounded(range)), io_stats)
+                .await?;
+            let bytes = get_result.bytes().await?;
+            crate::Result::Ok(bytes)
+        })
+    }
+
+    /// Drive a group slot to `Ready` and return its bytes. `Pending` spawns
+    /// the fetch first (lazy path — e.g. predicate-column reads that run
+    /// before the RG enters the decode window).
+    async fn drive_group(&self, slot: &GroupSlot) -> GroupResult {
+        let mut guard = slot.state.lock().await;
+        if let RangeState::Ready(r) = &*guard {
+            return r.clone();
+        }
+        if matches!(&*guard, RangeState::Released) {
+            return Err(Arc::new(
+                ReaderInternalSnafu {
+                    path: self.path.to_string(),
+                    message: "read from a released row-group byte range".to_string(),
+                }
+                .build(),
+            ));
+        }
+        if let RangeState::Pending(range) = &*guard {
+            *guard = RangeState::InFlight(self.spawn_fetch(range.clone()));
+        }
+        // Drive InFlight → Ready. Holding the lock across `.await` serializes
+        // concurrent waiters, but they'd have had to wait for the same spawned
+        // task to finish either way — no extra latency.
+        //
+        // `Pin::new(task).await` polls the task to completion without consuming
+        // it (RuntimeTask is Unpin), so the borrow ends with the inner block and
+        // we can then write the Ready result back through the same guard.
+        let res: GroupResult = {
+            let RangeState::InFlight(task) = &mut *guard else {
+                unreachable!("Ready/Released/Pending branches handled above")
+            };
+            match Pin::new(task).await {
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(e)) => Err(Arc::new(e)),
+                Err(daft_err) => Err(Arc::new(task_err(self.path.to_string())(daft_err))),
+            }
+        };
+        *guard = RangeState::Ready(res.clone());
+        res
+    }
+
+    /// Start background fetches for every still-`Pending` group of a row
+    /// group. Called when the RG enters the decode window so its bytes
+    /// arrive while (or before) its decoders need them. Does not wait for
+    /// completion.
+    async fn prefetch_rg(&self, rg_idx: usize) {
+        if let Some(rg) = self.rgs.get(&rg_idx) {
+            for slot in &rg.groups {
+                let mut guard = slot.state.lock().await;
+                if let RangeState::Pending(range) = &*guard {
+                    *guard = RangeState::InFlight(self.spawn_fetch(range.clone()));
+                }
+            }
         }
     }
 
@@ -662,6 +739,31 @@ impl RemoteChunkSource {
         split_groups
     }
 
+    /// Drop the cached bytes for a fully-decoded row group. The `Bytes` in
+    /// each `Ready` slot are refcounted slices — decoders still holding
+    /// `OffsetBytes` keep the allocation alive until they finish; this just
+    /// drops the cache's (usually last) reference so memory is O(in-flight
+    /// row groups) instead of O(file). Slots still `InFlight` are aborted
+    /// (dropping `RuntimeTask` cancels the fetch).
+    async fn release_rg(&self, rg_idx: usize) {
+        if let Some(rg) = self.rgs.get(&rg_idx) {
+            let mut released_bytes = 0usize;
+            for slot in &rg.groups {
+                let mut guard = slot.state.lock().await;
+                if let RangeState::Ready(Ok(b)) = &*guard {
+                    released_bytes += b.len();
+                }
+                *guard = RangeState::Released;
+            }
+            log::debug!(
+                "released rg={} cached_bytes={} path={}",
+                rg_idx,
+                released_bytes,
+                self.path
+            );
+        }
+    }
+
     async fn read_rg_chunks(
         &self,
         rg_idx: usize,
@@ -693,12 +795,11 @@ impl RemoteChunkSource {
         needed_groups.dedup();
 
         // Drive only the groups containing requested leaves, in parallel.
-        // Unrelated groups in this RG stay in-flight (or untouched) and we
-        // never park on their completion.
-        let path = self.path.as_ref();
+        // Unrelated groups in this RG stay pending/in-flight and we never
+        // park on their completion.
         let futs = needed_groups.iter().map(|&gi| {
             let slot = &rg.groups[gi];
-            async move { (gi, drive_group(slot, path).await) }
+            async move { (gi, self.drive_group(slot).await) }
         });
         let results = futures::future::join_all(futs).await;
 
