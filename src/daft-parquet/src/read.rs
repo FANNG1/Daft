@@ -807,4 +807,600 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Compare two record batches at the arrow level. `Series`/`RecordBatch`
+    /// `PartialEq` goes through `Series::equal`, which errors (and therefore
+    /// reports "not equal") for nested dtypes, so it can't be used here.
+    fn assert_batches_eq(case: &str, local: &RecordBatch, remote: &RecordBatch) {
+        assert_eq!(
+            local.len(),
+            remote.len(),
+            "case {case}: row count mismatch (local {} vs owned {})",
+            local.len(),
+            remote.len()
+        );
+        assert_eq!(
+            local.schema.to_string(),
+            remote.schema.to_string(),
+            "case {case}: schema mismatch"
+        );
+        for i in 0..local.schema.len() {
+            let l = local.get_column(i).to_arrow().unwrap();
+            let r = remote.get_column(i).to_arrow().unwrap();
+            assert!(
+                l.as_ref() == r.as_ref(),
+                "case {case}: column {} differs\nlocal: {:?}\nowned: {:?}",
+                local.schema[i].name,
+                l,
+                r
+            );
+        }
+    }
+
+    /// Differential parity: reading a local file through `file://` routes via
+    /// `ParquetSource::Url`, i.e. the owned remote row-group pipeline. Results
+    /// must match the local `ChunkSource` path row-for-row.
+    #[test]
+    fn test_owned_remote_parity_with_local() {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+        };
+        use daft_dsl::{lit, resolved_col};
+        use daft_recordbatch::RecordBatch;
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let dir = std::env::temp_dir().join("daft_test_owned_parity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("multi_rg.parquet");
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("val", ArrowDataType::Int64, false),
+            ArrowField::new("s", ArrowDataType::Utf8, false),
+        ]));
+        let file = std::fs::File::create(&file_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from((0..300i64).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..300i64).map(|i| i * 2).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..300).map(|i| format!("row-{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let local_path = file_path.to_str().unwrap().to_string();
+        let uri = format!("file://{local_path}");
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+
+        let pred = || resolved_col("val").gt(lit(150i64));
+        let cases: Vec<(&str, ParquetReadOptions)> = vec![
+            ("full", ParquetReadOptions::default()),
+            (
+                "projection",
+                ParquetReadOptions {
+                    columns: Some(vec!["s".to_string(), "id".to_string()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "limit_cross_rg",
+                ParquetReadOptions {
+                    num_rows: Some(250),
+                    ..Default::default()
+                },
+            ),
+            (
+                "limit_zero",
+                ParquetReadOptions {
+                    num_rows: Some(0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "offset_and_limit",
+                ParquetReadOptions {
+                    start_offset: Some(150),
+                    num_rows: Some(100),
+                    ..Default::default()
+                },
+            ),
+            (
+                "small_batch_size",
+                ParquetReadOptions {
+                    batch_size: Some(7),
+                    num_rows: Some(33),
+                    ..Default::default()
+                },
+            ),
+            (
+                "dup_out_of_order_row_groups",
+                ParquetReadOptions {
+                    row_groups: Some(vec![2, 0, 0]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "deletes",
+                ParquetReadOptions {
+                    delete_rows: Some(vec![0, 5, 99, 100, 299]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "predicate",
+                ParquetReadOptions {
+                    predicate: Some(pred()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "predicate_limit",
+                ParquetReadOptions {
+                    predicate: Some(pred()),
+                    num_rows: Some(37),
+                    batch_size: Some(10),
+                    ..Default::default()
+                },
+            ),
+            (
+                "predicate_only_cols",
+                ParquetReadOptions {
+                    columns: Some(vec!["val".to_string()]),
+                    predicate: Some(pred()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "predicate_offset_deletes",
+                ParquetReadOptions {
+                    predicate: Some(resolved_col("id").lt(lit(250i64))),
+                    delete_rows: Some(vec![3, 101]),
+                    start_offset: Some(50),
+                    ..Default::default()
+                },
+            ),
+            (
+                // Selects everything in RG0, nothing in RG1/RG2.
+                "predicate_empty_in_later_rgs",
+                ParquetReadOptions {
+                    predicate: Some(resolved_col("id").lt(lit(100i64))),
+                    ..Default::default()
+                },
+            ),
+            (
+                "predicate_matches_nothing",
+                ParquetReadOptions {
+                    predicate: Some(resolved_col("id").gt(lit(10_000i64))),
+                    ..Default::default()
+                },
+            ),
+            (
+                // Predicate column is not part of the projection.
+                "predicate_col_not_projected",
+                ParquetReadOptions {
+                    columns: Some(vec!["s".to_string()]),
+                    predicate: Some(pred()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "limit_beyond_eof",
+                ParquetReadOptions {
+                    num_rows: Some(10_000),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        async fn collect_one(
+            source: crate::reader::ParquetSource<'_>,
+            opts: &ParquetReadOptions,
+        ) -> DaftResult<RecordBatch> {
+            let (schema, stream) = Box::pin(crate::reader::stream_parquet(source, opts)).await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            if batches.is_empty() {
+                return Ok(RecordBatch::empty(Some(schema)));
+            }
+            RecordBatch::concat(&batches)
+        }
+
+        for (name, opts) in cases {
+            let local_path = local_path.clone();
+            let uri = uri.clone();
+            let io_client = io_client.clone();
+            let (local, remote) = runtime
+                .block_within_async_context(async move {
+                    let local = collect_one(
+                        crate::reader::ParquetSource::Local { path: &local_path },
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+                    let remote = collect_one(
+                        crate::reader::ParquetSource::Url {
+                            uri: &uri,
+                            io_client,
+                            io_stats: None,
+                        },
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+                    (local, remote)
+                })
+                .unwrap();
+            assert_batches_eq(name, &local, &remote);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A decode failure inside a row group must surface as an error on the
+    /// owned remote path, not silently truncate the stream.
+    #[test]
+    fn test_owned_remote_surfaces_decode_error() {
+        use std::os::unix::fs::FileExt;
+
+        use arrow::{
+            array::Int64Array,
+            datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+        };
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let dir = std::env::temp_dir().join("daft_test_owned_corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("corrupt.parquet");
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let file = std::fs::File::create(&file_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        writer
+            .write(
+                &arrow::array::RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(Int64Array::from((0..300i64).collect::<Vec<_>>()))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+
+        // Corrupt the page header at the start of row group 1's only column chunk.
+        let md = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&std::fs::File::open(&file_path).unwrap())
+            .unwrap();
+        let (start, _len) = md.row_group(1).column(0).byte_range();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        f.write_at(&[0xFF; 8], start).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let local_path = file_path.to_str().unwrap().to_string();
+        let uri = format!("file://{local_path}");
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+
+        let (local_res, remote_res) = runtime
+            .block_within_async_context(async move {
+                let local = async {
+                    let (_s, stream) = Box::pin(crate::reader::stream_parquet(
+                        crate::reader::ParquetSource::Local { path: &local_path },
+                        &ParquetReadOptions::default(),
+                    ))
+                    .await?;
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    DaftResult::Ok(batches.iter().map(RecordBatch::len).sum::<usize>())
+                }
+                .await;
+                let remote = async {
+                    let (_s, stream) = Box::pin(crate::reader::stream_parquet(
+                        crate::reader::ParquetSource::Url {
+                            uri: &uri,
+                            io_client,
+                            io_stats: None,
+                        },
+                        &ParquetReadOptions::default(),
+                    ))
+                    .await?;
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    DaftResult::Ok(batches.iter().map(RecordBatch::len).sum::<usize>())
+                }
+                .await;
+                (local, remote)
+            })
+            .unwrap();
+
+        assert!(
+            local_res.is_err(),
+            "local path silently returned {local_res:?} rows for a corrupt row group"
+        );
+        assert!(
+            remote_res.is_err(),
+            "owned remote path silently returned {remote_res:?} rows for a corrupt row group"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the owned remote stream after the first batch must not hang or
+    /// panic, and the reader must stay usable afterwards.
+    #[test]
+    fn test_owned_remote_early_drop() {
+        use arrow::{
+            array::Int64Array,
+            datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+        };
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let dir = std::env::temp_dir().join("daft_test_owned_early_drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("many_rgs.parquet");
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let file = std::fs::File::create(&file_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        writer
+            .write(
+                &arrow::array::RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(Int64Array::from((0..2000i64).collect::<Vec<_>>()))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+
+        let uri = format!("file://{}", file_path.to_str().unwrap());
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+
+        let total = runtime
+            .block_within_async_context(async move {
+                let opts = ParquetReadOptions {
+                    batch_size: Some(10),
+                    ..Default::default()
+                };
+                {
+                    let (_s, mut stream) = Box::pin(crate::reader::stream_parquet(
+                        crate::reader::ParquetSource::Url {
+                            uri: &uri,
+                            io_client: io_client.clone(),
+                            io_stats: None,
+                        },
+                        &opts,
+                    ))
+                    .await
+                    .unwrap();
+                    let first = stream.next().await.unwrap().unwrap();
+                    assert_eq!(first.len(), 10);
+                    // stream dropped here, mid-file
+                }
+                // Reader still works after the abort.
+                let (_s, stream) = Box::pin(crate::reader::stream_parquet(
+                    crate::reader::ParquetSource::Url {
+                        uri: &uri,
+                        io_client,
+                        io_stats: None,
+                    },
+                    &ParquetReadOptions::default(),
+                ))
+                .await
+                .unwrap();
+                let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+                batches.iter().map(RecordBatch::len).sum::<usize>()
+            })
+            .unwrap();
+        assert_eq!(total, 2000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same differential parity check, but on nested/multi-leaf columns and
+    /// with more row groups than the owned pipeline's lookahead depth.
+    #[test]
+    fn test_owned_remote_parity_nested() {
+        use arrow::{
+            array::{ArrayRef, Int64Array, Int64Builder, ListBuilder, StringArray, StructArray},
+            datatypes::{
+                DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
+            },
+        };
+        use daft_dsl::{lit, resolved_col};
+        use daft_recordbatch::RecordBatch;
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+
+        let dir = std::env::temp_dir().join("daft_test_owned_parity_nested");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("nested.parquet");
+
+        const N: i64 = 500;
+        let struct_fields: Fields = vec![
+            ArrowField::new("x", ArrowDataType::Int64, true),
+            ArrowField::new("y", ArrowDataType::Utf8, true),
+        ]
+        .into();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("st", ArrowDataType::Struct(struct_fields.clone()), true),
+            ArrowField::new(
+                "lst",
+                ArrowDataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Int64,
+                    true,
+                ))),
+                true,
+            ),
+        ]));
+
+        let ids: ArrayRef = Arc::new(Int64Array::from((0..N).collect::<Vec<_>>()));
+        let st: ArrayRef = Arc::new(StructArray::new(
+            struct_fields,
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..N)
+                        .map(|i| if i % 7 == 0 { None } else { Some(i * 3) })
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..N)
+                        .map(|i| {
+                            if i % 5 == 0 {
+                                None
+                            } else {
+                                Some(format!("s{i}"))
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        ));
+        let mut list_builder = ListBuilder::new(Int64Builder::new());
+        for i in 0..N {
+            if i % 11 == 0 {
+                list_builder.append_null();
+            } else {
+                for k in 0..(i % 4) {
+                    list_builder.values().append_value(i * 10 + k);
+                }
+                list_builder.append(true);
+            }
+        }
+        let lst: ArrayRef = Arc::new(list_builder.finish());
+
+        let file = std::fs::File::create(&file_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(50))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        writer
+            .write(&arrow::array::RecordBatch::try_new(schema, vec![ids, st, lst]).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+
+        let local_path = file_path.to_str().unwrap().to_string();
+        let uri = format!("file://{local_path}");
+        let io_client = Arc::new(IOClient::new(IOConfig::default().into()).unwrap());
+        let runtime = get_io_runtime(true);
+
+        let cases: Vec<(&str, ParquetReadOptions)> = vec![
+            ("full_nested", ParquetReadOptions::default()),
+            (
+                "only_list",
+                ParquetReadOptions {
+                    columns: Some(vec!["lst".to_string()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "only_struct",
+                ParquetReadOptions {
+                    columns: Some(vec!["st".to_string()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nested_predicate_pushdown",
+                ParquetReadOptions {
+                    columns: Some(vec!["st".to_string(), "lst".to_string()]),
+                    predicate: Some(resolved_col("id").gt(lit(133i64))),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nested_predicate_limit",
+                ParquetReadOptions {
+                    predicate: Some(resolved_col("id").gt(lit(133i64))),
+                    num_rows: Some(77),
+                    batch_size: Some(16),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nested_offset_limit",
+                ParquetReadOptions {
+                    start_offset: Some(133),
+                    num_rows: Some(211),
+                    batch_size: Some(32),
+                    ..Default::default()
+                },
+            ),
+            (
+                "nested_dup_rgs",
+                ParquetReadOptions {
+                    row_groups: Some(vec![9, 0, 5, 5]),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        async fn collect_one(
+            source: crate::reader::ParquetSource<'_>,
+            opts: &ParquetReadOptions,
+        ) -> DaftResult<RecordBatch> {
+            let (schema, stream) = Box::pin(crate::reader::stream_parquet(source, opts)).await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            if batches.is_empty() {
+                return Ok(RecordBatch::empty(Some(schema)));
+            }
+            RecordBatch::concat(&batches)
+        }
+
+        for (name, opts) in cases {
+            let local_path = local_path.clone();
+            let uri = uri.clone();
+            let io_client = io_client.clone();
+            let (local, remote) = runtime
+                .block_within_async_context(async move {
+                    let local = collect_one(
+                        crate::reader::ParquetSource::Local { path: &local_path },
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+                    let remote = collect_one(
+                        crate::reader::ParquetSource::Url {
+                            uri: &uri,
+                            io_client,
+                            io_stats: None,
+                        },
+                        &opts,
+                    )
+                    .await
+                    .unwrap();
+                    (local, remote)
+                })
+                .unwrap();
+            assert_batches_eq(name, &local, &remote);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
