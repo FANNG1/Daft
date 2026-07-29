@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use super::{
     RgTaskCtx,
-    chunk_source::ChunkSource,
+    chunk_source::RgAccess,
     field_reader::{decode_one_streaming, leaves_for_top_fields},
     util::{
         eval_predicate_mask, filter_arrays_by_mask, project_to_schema, record_batch_from_arrow,
@@ -49,7 +49,7 @@ pub(super) async fn recv_one_chunk(receivers: &mut [ColRx]) -> DaftResult<Option
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_col_decoders(
     col_indices: &[usize],
-    chunk_source: &Arc<ChunkSource>,
+    access: &RgAccess,
     metadata: &Arc<ParquetMetaData>,
     arrow_schema: &Arc<ArrowSchema>,
     selection: Option<&RowSelection>,
@@ -57,15 +57,22 @@ pub(super) async fn spawn_col_decoders(
     chunk_size: usize,
     path: &Arc<str>,
 ) -> DaftResult<(Vec<ColRx>, JoinSet<DaftResult<()>>)> {
-    // The reader picks its own per-RG access pattern (batched pre-fetch for
-    // local, lazy per-column for remote). See `ChunkSource::open_rg`.
+    // This is the common decode boundary for both paths:
+    // - local: `RgAccess::Source` opens the legacy chunk source;
+    // - PR1 remote: `RgAccess::Resident` hands out clones of one owned RG.
+    //
+    // Thus the column decoder does not need remote-lifetime branches. Holding
+    // its `RgReader::Resident` clone is also what keeps the compressed bytes
+    // alive until this decoder completes or is cancelled.
     let all_leaves: Arc<[usize]> = leaves_for_top_fields(metadata.as_ref(), col_indices).into();
-    let rg_reader = chunk_source.clone().open_rg(rg_idx, all_leaves).await?;
+    let rg_reader = access.open_rg(rg_idx, all_leaves).await?;
 
     let compute = get_compute_runtime();
     let mut rxs = Vec::with_capacity(col_indices.len());
     let mut joinset: JoinSet<DaftResult<()>> = JoinSet::new();
     for &col_idx in col_indices {
+        // Capacity 1 deliberately provides backpressure. A fast column cannot
+        // run arbitrarily far ahead of the slowest column or of batch assembly.
         let (tx, rx) = mpsc::channel::<DaftResult<ArrayRef>>(1);
         let rg_reader = rg_reader.clone();
         let metadata = metadata.clone();
@@ -114,6 +121,7 @@ struct StreamingState {
 
 pub(super) async fn process_rg_with_data_cols(
     ctx: Arc<RgTaskCtx>,
+    access: RgAccess,
     rg_idx: usize,
     selection: Option<RowSelection>,
     filtered_pred: Vec<ArrayRef>,
@@ -124,7 +132,7 @@ pub(super) async fn process_rg_with_data_cols(
 
     let (col_receivers, mut col_decoders) = match spawn_col_decoders(
         &ctx.plan.data_col_indices,
-        &ctx.chunk_source,
+        &access,
         &ctx.metadata,
         &ctx.arrow_schema,
         selection.as_ref(),
@@ -138,6 +146,9 @@ pub(super) async fn process_rg_with_data_cols(
         Err(e) => return err_stream(e),
     };
 
+    // Phase 2: decode output columns using the selection built by the optional
+    // predicate prefilter. Predicate arrays have already been filtered in
+    // phase 1, so reuse them instead of decoding the same column twice.
     let state = StreamingState {
         ctx,
         col_receivers,
@@ -215,6 +226,7 @@ struct PredicateOnlyState {
 
 pub(super) async fn process_rg_predicate_only(
     ctx: Arc<RgTaskCtx>,
+    access: RgAccess,
     rg_idx: usize,
     selection: Option<RowSelection>,
 ) -> BoxStream<'static, DaftResult<RecordBatch>> {
@@ -226,7 +238,7 @@ pub(super) async fn process_rg_predicate_only(
 
     let (col_receivers, mut col_decoders) = match spawn_col_decoders(
         &plan.pred_col_indices,
-        &ctx.chunk_source,
+        &access,
         &ctx.metadata,
         &ctx.arrow_schema,
         selection.as_ref(),
@@ -240,6 +252,8 @@ pub(super) async fn process_rg_predicate_only(
         Err(e) => return err_stream(e),
     };
 
+    // Predicate-only means every read column belongs to the predicate. There
+    // is no phase-1/phase-2 split; evaluate each decoded chunk directly.
     // Build schemas + bind predicate once per RG (was ~50µs/chunk overhead).
     let chunk_arrow_schema = schema_from_indices(&ctx.arrow_schema, &plan.pred_col_indices);
     let chunk_daft_schema = match Schema::try_from(chunk_arrow_schema.as_ref()) {

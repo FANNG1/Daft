@@ -295,6 +295,28 @@ impl ChunkSourceBuilder {
             )),
         }
     }
+
+    /// [PR1 remote-reader change] Build an immutable remote range plan without
+    /// issuing GETs. Local sources retain their existing read path.
+    ///
+    /// The old `build` path prepares remote fetches for all selected RGs at
+    /// once. Separating planning from downloading means row-group pruning and
+    /// the ordered coordinator can decide *when* bytes become resident. The
+    /// plan intentionally contains only metadata/ranges, never response bytes.
+    pub(super) fn build_plan(
+        self,
+        parquet_metadata: &Arc<ParquetMetaData>,
+        rg_indices: &[usize],
+    ) -> Result<RemoteChunkSourcePlan, Box<Self>> {
+        match self {
+            Self::Local(_) => Err(Box::new(self)),
+            Self::Remote(prep) => Ok(RemoteChunkSourcePlan::from_metadata(
+                prep,
+                parquet_metadata,
+                rg_indices,
+            )),
+        }
+    }
 }
 
 impl ChunkSource {
@@ -359,6 +381,7 @@ pub(crate) enum RgReader {
         chunk_source: Arc<ChunkSource>,
         rg_idx: usize,
     },
+    Resident(Arc<ResidentRowGroup>),
 }
 
 impl RgReader {
@@ -374,6 +397,7 @@ impl RgReader {
             } => Ok(Arc::new(
                 chunk_source.read_rg_chunks(*rg_idx, col_leaves).await?,
             )),
+            Self::Resident(resident) => Ok(resident.leaves.clone()),
         }
     }
 }
@@ -544,17 +568,7 @@ impl RemoteChunkSource {
         let mut rgs = HashMap::with_capacity(active_rg_indices.len());
 
         for &rg_idx in active_rg_indices {
-            let rg = parquet_metadata.row_group(rg_idx);
-            let mut leaf_ranges: Vec<LeafRange> = Vec::with_capacity(active_col_indices.len());
-            for &col_idx in active_col_indices {
-                let (start, len) = rg.column(col_idx).byte_range();
-                leaf_ranges.push(LeafRange {
-                    leaf: col_idx,
-                    start,
-                    len,
-                });
-            }
-            let groups = Self::coalesce_and_split(leaf_ranges);
+            let groups = rg_coalesced_layout(&parquet_metadata, rg_idx, active_col_indices);
 
             let mut group_slots: Vec<GroupSlot> = Vec::with_capacity(groups.len());
             let mut leaves: HashMap<usize, LeafLoc> =
@@ -729,5 +743,164 @@ impl RemoteChunkSource {
             );
         }
         Ok(out)
+    }
+}
+
+/// Keep the remote eager reader and the owned reader on exactly the same
+/// coalesced/split range layout. PR1 changes byte lifetime and scheduling, not
+/// the GET layout: retaining this shared helper limits behavioural/performance
+/// drift between the two implementations.
+fn rg_coalesced_layout(
+    metadata: &ParquetMetaData,
+    rg_idx: usize,
+    active_col_indices: &[usize],
+) -> Vec<RangeGroup> {
+    let rg = metadata.row_group(rg_idx);
+    let leaf_ranges = active_col_indices
+        .iter()
+        .map(|&col_idx| {
+            let (start, len) = rg.column(col_idx).byte_range();
+            LeafRange {
+                leaf: col_idx,
+                start,
+                len,
+            }
+        })
+        .collect();
+    RemoteChunkSource::coalesce_and_split(leaf_ranges)
+}
+
+/// [PR1 remote-reader change] Immutable remote range plan.
+///
+/// It is indexed by row-group *occurrence*, rather than row-group number, so
+/// duplicate or out-of-order requests get independent downloads and lifetimes.
+/// Keeping only ranges here avoids a file-sized resident-byte set; the cost is
+/// that selecting the same RG twice intentionally performs two downloads.
+pub(crate) struct RemoteChunkSourcePlan {
+    path: Arc<str>,
+    file_len: u64,
+    uri: String,
+    io_client: Arc<daft_io::IOClient>,
+    io_stats: Option<daft_io::IOStatsRef>,
+    per_occurrence: Vec<Vec<RangeGroup>>,
+}
+
+impl RemoteChunkSourcePlan {
+    fn from_metadata(
+        prep: RemoteChunkSourcePrep,
+        parquet_metadata: &Arc<ParquetMetaData>,
+        rg_indices: &[usize],
+    ) -> Self {
+        let per_occurrence = rg_indices
+            .iter()
+            .map(|&rg_idx| rg_coalesced_layout(parquet_metadata, rg_idx, &prep.active_col_indices))
+            .collect();
+        Self {
+            path: prep.path,
+            file_len: prep.file_size as u64,
+            uri: prep.uri,
+            io_client: prep.io_client,
+            io_stats: prep.io_stats,
+            per_occurrence,
+        }
+    }
+
+    /// Download one planned occurrence and bind all of its range bytes to one
+    /// owner. Range groups within the RG still download concurrently, preserving
+    /// the existing coalescing behavior; cross-RG concurrency is bounded by the
+    /// coordinator, not by this function.
+    pub(super) async fn download_occurrence(
+        &self,
+        occurrence: usize,
+    ) -> crate::Result<ResidentRowGroup> {
+        let groups = &self.per_occurrence[occurrence];
+        let fetches = groups.iter().map(|group| {
+            let range = group.start as usize..group.end as usize;
+            let uri = self.uri.clone();
+            let io_client = self.io_client.clone();
+            let io_stats = self.io_stats.clone();
+            async move {
+                let expected = range.end - range.start;
+                let bytes = io_client
+                    .single_url_get(
+                        uri,
+                        Some(daft_io::range::GetRange::Bounded(range)),
+                        io_stats,
+                    )
+                    .await?
+                    .bytes()
+                    .await?;
+                Ok::<_, crate::Error>((bytes, expected))
+            }
+        });
+        let results = futures::future::try_join_all(fetches).await?;
+
+        let mut group_bytes = Vec::with_capacity(results.len());
+        for (index, (bytes, expected)) in results.into_iter().enumerate() {
+            if bytes.len() != expected {
+                return Err(ReaderInternalSnafu {
+                    path: self.path.to_string(),
+                    message: format!(
+                        "range GET length mismatch for group {index}: expected {expected} bytes, got {}",
+                        bytes.len()
+                    ),
+                }
+                .build());
+            }
+            group_bytes.push(bytes);
+        }
+
+        let mut leaves = HashMap::new();
+        for (group, bytes) in groups.iter().zip(&group_bytes) {
+            for &LeafRange { leaf, start, len } in &group.members {
+                let local_start = (start - group.start) as usize;
+                leaves.insert(
+                    leaf,
+                    OffsetBytes {
+                        base: start,
+                        file_len: self.file_len,
+                        bytes: bytes.slice(local_start..local_start + len as usize),
+                    },
+                );
+            }
+        }
+        Ok(ResidentRowGroup {
+            group_bytes,
+            leaves: Arc::new(leaves),
+        })
+    }
+}
+
+/// [PR1 remote-reader change] The sole owner of a remote RG's downloaded bytes.
+///
+/// Decoder readers clone this through `RgReader::Resident`, so bytes live
+/// through decode and are released on success, error, panic, or cancellation.
+/// Making ownership explicit is safer than an "evict after decode" protocol:
+/// every exit path is handled by `Arc` drop. PR1 does not attach a byte-budget
+/// permit here; process-wide admission is intentionally deferred.
+pub(crate) struct ResidentRowGroup {
+    #[allow(dead_code)]
+    group_bytes: Vec<Bytes>,
+    pub(super) leaves: Arc<HashMap<usize, OffsetBytes>>,
+}
+
+/// A small adapter that lets decoder code consume either the legacy source or
+/// an owned remote RG. This keeps decoding semantics shared; only how bytes
+/// are acquired and retained differs between local and PR1 remote reads.
+pub(crate) enum RgAccess {
+    Source(Arc<ChunkSource>),
+    Resident(Arc<ResidentRowGroup>),
+}
+
+impl RgAccess {
+    pub(super) async fn open_rg(
+        &self,
+        rg_idx: usize,
+        all_leaves: Arc<[usize]>,
+    ) -> crate::Result<RgReader> {
+        match self {
+            Self::Source(source) => source.clone().open_rg(rg_idx, all_leaves).await,
+            Self::Resident(resident) => Ok(RgReader::Resident(resident.clone())),
+        }
     }
 }
