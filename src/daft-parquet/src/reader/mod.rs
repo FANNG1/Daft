@@ -3,6 +3,20 @@ mod field_reader;
 mod rg_processor;
 mod util;
 
+// Parquet read flow (high level):
+//
+// 1. `stream_parquet` opens the source and reads footer metadata.
+// 2. `resolve_column_plan` separates projected columns, predicate-only columns,
+//    and the schema that will be visible to the caller.
+// 3. `prune_row_groups` eliminates RGs from statistics and user constraints;
+//    `build_base_selections` then expresses offset/deletes/limit within each
+//    surviving RG.
+// 4. Each RG is decoded as a stream of column-aligned batches. The local path
+//    uses the established `ChunkSource` implementation. The remote path uses
+//    the PR1 owned-RG pipeline below.
+// 5. `apply_cross_rg_limit` is the final owner of a global result limit, so
+//    concurrent RG work cannot race while deciding which rows to return.
+
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
@@ -235,7 +249,10 @@ fn build_base_selections(
     rg_indices: &[usize],
     opts: &ParquetReadOptions,
 ) -> Vec<Option<RowSelection>> {
-    // With a predicate, limit is enforced post-filter, not at RG-build time.
+    // With a predicate, limit is enforced post-filter, not at RG-build time:
+    // `num_rows=10` means ten *matching* rows, not ten input rows. The owned
+    // path also runs RGs concurrently, so the global post-filter limit cannot
+    // be mutated here by individual RG tasks.
     let global_starts = build_global_starts(metadata);
     let start_offset = opts.start_offset.unwrap_or(0);
     let delete_rows = opts.delete_rows.as_deref();
@@ -465,8 +482,13 @@ async fn build_rg_inputs(
     Ok(out)
 }
 
-/// Predicate prefilter state shared by the independently scheduled remote
-/// row-group tasks.
+/// Predicate prefilter state shared by independently scheduled remote RG tasks.
+///
+/// PR1 choice: bind the predicate once, but evaluate it inside the lifetime of
+/// one owned RG. This avoids retaining predicate-column buffers for every RG
+/// in the file. The tradeoff is that a later in-flight RG can do work which an
+/// earlier RG's global limit will ultimately make unnecessary; ordered output
+/// and bounded lookahead keep that speculative work small and deterministic.
 struct PredPrefilter {
     pred_arrow_schema: Arc<ArrowSchema>,
     bound_pred: BoundExpr,
@@ -498,9 +520,11 @@ impl PredPrefilter {
     }
 }
 
-/// Run a pushed predicate for one owned row group. The global limit is
-/// intentionally not applied here: concurrently executing row groups must
-/// not share mutable limit state; the ordered outer stream owns truncation.
+/// Run a pushed predicate for one owned row group.
+///
+/// `max_selected_rows` is only a per-RG early-stop hint. The global limit is
+/// intentionally not consumed here: concurrently executing RGs must not share
+/// mutable limit state; the ordered outer stream owns the final truncation.
 #[allow(clippy::too_many_arguments)]
 async fn prefilter_one_rg(
     access: &RgAccess,
@@ -681,9 +705,10 @@ fn apply_cross_rg_limit(
     let Some(limit) = limit else {
         return Box::pin(stream);
     };
-    // `scan` ends the stream when the closure yields `None`, so once we hit
-    // the limit, upstream RG tasks see the receiver close and abort their
-    // decoders. `filter_map` would keep polling upstream forever.
+    // `scan` ends the stream when the closure yields `None`. This is more than
+    // an optimization: once the caller has enough rows, closing the upstream
+    // receiver lets the owned-RG coordinator cancel remaining decode work and
+    // drop its resident bytes. `filter_map` would keep polling upstream.
     let bounded = stream.scan(limit, |remaining, res| {
         let out = match res {
             Err(e) => Some(Err(e)),
@@ -719,8 +744,8 @@ pub async fn stream_parquet(
     let plan = resolve_column_plan(&prepared, opts)?;
 
     // Single RG-level pruning pass: user row_groups + positional (start_offset,
-    // num_rows) + predicate stats. Must run before `cs_builder.build`, which is
-    // what spawns remote byte fetches.
+    // num_rows) + predicate stats. It must precede any remote data GET: footer
+    // metadata is cheap, whereas downloading a pruned RG is pure waste.
     let rg_indices = prune_row_groups(
         &prepared.parquet_metadata,
         opts.row_groups.as_deref(),
@@ -765,9 +790,13 @@ pub async fn stream_parquet(
         chunk_size,
     });
 
+    // [PR1 remote-reader change]
     // Remote reads use an owned row-group pipeline. Planning does not issue
-    // GETs; each occurrence downloads only when it enters the bounded
-    // lookahead. Local reads retain the existing ChunkSource path.
+    // GETs; each requested RG occurrence downloads only when it enters the
+    // bounded lookahead. This replaces eager whole-file prefetch for remote
+    // sources, while deliberately leaving the mature local `ChunkSource` path
+    // unchanged. PR1 does not attempt a process-wide byte budget; its scope is
+    // the more fundamental ownership/lifetime boundary.
     let cs_builder = match cs_builder.build_plan(&prepared.parquet_metadata, &rg_indices) {
         Ok(remote_plan) => {
             let base_selections =
@@ -817,6 +846,11 @@ pub async fn stream_parquet(
     Ok((return_schema, apply_cross_rg_limit(stream, opts.num_rows)))
 }
 
+// [PR1 remote-reader change]
+// At most this many RG pipelines per file may have downloaded bytes or be
+// decoding at once. Two overlaps I/O/CPU with ordered downstream consumption
+// without recreating the previous O(file) eager-prefetch residency. This is a
+// per-file bound, not a process-wide memory admission guarantee.
 const REMOTE_RG_LOOKAHEAD: usize = 2;
 
 type InflightRg = (
@@ -824,9 +858,14 @@ type InflightRg = (
     tokio::sync::mpsc::Receiver<DaftResult<RecordBatch>>,
 );
 
-/// Ordered remote pipeline with a bounded task lookahead. The coordinator is
-/// owned by the returned stream, so dropping that stream aborts outstanding
-/// row-group tasks and releases their `ResidentRowGroup`s.
+/// [PR1 remote-reader change] Ordered remote pipeline with bounded lookahead.
+///
+/// The coordinator starts up to `REMOTE_RG_LOOKAHEAD` worker-local runtime
+/// tasks, but drains only the oldest RG before advancing. That preserves Parquet
+/// file order even though downloading/decoding overlaps. It is not a Ray task:
+/// the surrounding scan task owns this coordinator. The returned stream owns
+/// the coordinator, so early downstream cancellation aborts outstanding tasks
+/// and releases their `ResidentRowGroup`s.
 fn stream_parquet_owned(
     remote_plan: Arc<chunk_source::RemoteChunkSourcePlan>,
     ctx: Arc<RgTaskCtx>,
@@ -849,6 +888,8 @@ fn stream_parquet_owned(
             .collect::<std::collections::VecDeque<_>>();
 
         loop {
+            // Fill a small ordered window. `occurrence`, rather than `rg_idx`,
+            // is the identity here because callers may request an RG twice.
             while inflight.len() < REMOTE_RG_LOOKAHEAD {
                 let Some((occurrence, (rg_idx, base_sel))) = pending.pop_front() else {
                     break;
@@ -858,6 +899,9 @@ fn stream_parquet_owned(
                 let ctx = ctx.clone();
                 let pred_setup = pred_setup.clone();
                 let task = compute.spawn(async move {
+                    // Downloading constructs the only owner for this RG's
+                    // compressed bytes. All decoder readers below clone it,
+                    // binding byte lifetime to decoder lifetime by type.
                     let resident = Arc::new(remote_plan.download_occurrence(occurrence).await?);
                     let access = RgAccess::Resident(resident);
                     let inputs = match pred_setup.as_deref() {
@@ -906,6 +950,8 @@ fn stream_parquet_owned(
             let Some((task, mut rx)) = inflight.pop_front() else {
                 break;
             };
+            // Drain in request order. Later RGs can run, but cannot overtake
+            // this one in the output stream.
             while let Some(batch) = rx.recv().await {
                 if out_tx.send(batch).await.is_err() {
                     return Ok(());

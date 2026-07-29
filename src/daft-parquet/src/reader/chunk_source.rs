@@ -296,8 +296,13 @@ impl ChunkSourceBuilder {
         }
     }
 
-    /// Build immutable remote range plans without issuing any GETs. Local
-    /// sources retain their existing read path.
+    /// [PR1 remote-reader change] Build an immutable remote range plan without
+    /// issuing GETs. Local sources retain their existing read path.
+    ///
+    /// The old `build` path prepares remote fetches for all selected RGs at
+    /// once. Separating planning from downloading means row-group pruning and
+    /// the ordered coordinator can decide *when* bytes become resident. The
+    /// plan intentionally contains only metadata/ranges, never response bytes.
     pub(super) fn build_plan(
         self,
         parquet_metadata: &Arc<ParquetMetaData>,
@@ -742,7 +747,9 @@ impl RemoteChunkSource {
 }
 
 /// Keep the remote eager reader and the owned reader on exactly the same
-/// coalesced/split range layout.
+/// coalesced/split range layout. PR1 changes byte lifetime and scheduling, not
+/// the GET layout: retaining this shared helper limits behavioural/performance
+/// drift between the two implementations.
 fn rg_coalesced_layout(
     metadata: &ParquetMetaData,
     rg_idx: usize,
@@ -763,9 +770,12 @@ fn rg_coalesced_layout(
     RemoteChunkSource::coalesce_and_split(leaf_ranges)
 }
 
-/// Immutable remote range plan, indexed by row-group occurrence rather than
-/// row-group number so duplicate requested row groups have independent
-/// downloads and lifetimes.
+/// [PR1 remote-reader change] Immutable remote range plan.
+///
+/// It is indexed by row-group *occurrence*, rather than row-group number, so
+/// duplicate or out-of-order requests get independent downloads and lifetimes.
+/// Keeping only ranges here avoids a file-sized resident-byte set; the cost is
+/// that selecting the same RG twice intentionally performs two downloads.
 pub(crate) struct RemoteChunkSourcePlan {
     path: Arc<str>,
     file_len: u64,
@@ -795,7 +805,10 @@ impl RemoteChunkSourcePlan {
         }
     }
 
-    /// Download a single occurrence and bind all its range bytes to one owner.
+    /// Download one planned occurrence and bind all of its range bytes to one
+    /// owner. Range groups within the RG still download concurrently, preserving
+    /// the existing coalescing behavior; cross-RG concurrency is bounded by the
+    /// coordinator, not by this function.
     pub(super) async fn download_occurrence(
         &self,
         occurrence: usize,
@@ -858,15 +871,22 @@ impl RemoteChunkSourcePlan {
     }
 }
 
-/// The sole owner of a remote row group's downloaded bytes. Decoder readers
-/// clone this through `RgReader::Resident`, so bytes live through decode and
-/// are released on success, error, panic, or cancellation.
+/// [PR1 remote-reader change] The sole owner of a remote RG's downloaded bytes.
+///
+/// Decoder readers clone this through `RgReader::Resident`, so bytes live
+/// through decode and are released on success, error, panic, or cancellation.
+/// Making ownership explicit is safer than an "evict after decode" protocol:
+/// every exit path is handled by `Arc` drop. PR1 does not attach a byte-budget
+/// permit here; process-wide admission is intentionally deferred.
 pub(crate) struct ResidentRowGroup {
     #[allow(dead_code)]
     group_bytes: Vec<Bytes>,
     pub(super) leaves: Arc<HashMap<usize, OffsetBytes>>,
 }
 
+/// A small adapter that lets decoder code consume either the legacy source or
+/// an owned remote RG. This keeps decoding semantics shared; only how bytes
+/// are acquired and retained differs between local and PR1 remote reads.
 pub(crate) enum RgAccess {
     Source(Arc<ChunkSource>),
     Resident(Arc<ResidentRowGroup>),

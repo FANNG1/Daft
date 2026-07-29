@@ -57,9 +57,13 @@ pub(super) async fn spawn_col_decoders(
     chunk_size: usize,
     path: &Arc<str>,
 ) -> DaftResult<(Vec<ColRx>, JoinSet<DaftResult<()>>)> {
-    // The reader picks its own per-RG access pattern (batched pre-fetch for
-    // local prefetch or an owned resident row group. Decoder clones keep an
-    // owned row group's bytes alive.
+    // This is the common decode boundary for both paths:
+    // - local: `RgAccess::Source` opens the legacy chunk source;
+    // - PR1 remote: `RgAccess::Resident` hands out clones of one owned RG.
+    //
+    // Thus the column decoder does not need remote-lifetime branches. Holding
+    // its `RgReader::Resident` clone is also what keeps the compressed bytes
+    // alive until this decoder completes or is cancelled.
     let all_leaves: Arc<[usize]> = leaves_for_top_fields(metadata.as_ref(), col_indices).into();
     let rg_reader = access.open_rg(rg_idx, all_leaves).await?;
 
@@ -67,6 +71,8 @@ pub(super) async fn spawn_col_decoders(
     let mut rxs = Vec::with_capacity(col_indices.len());
     let mut joinset: JoinSet<DaftResult<()>> = JoinSet::new();
     for &col_idx in col_indices {
+        // Capacity 1 deliberately provides backpressure. A fast column cannot
+        // run arbitrarily far ahead of the slowest column or of batch assembly.
         let (tx, rx) = mpsc::channel::<DaftResult<ArrayRef>>(1);
         let rg_reader = rg_reader.clone();
         let metadata = metadata.clone();
@@ -140,6 +146,9 @@ pub(super) async fn process_rg_with_data_cols(
         Err(e) => return err_stream(e),
     };
 
+    // Phase 2: decode output columns using the selection built by the optional
+    // predicate prefilter. Predicate arrays have already been filtered in
+    // phase 1, so reuse them instead of decoding the same column twice.
     let state = StreamingState {
         ctx,
         col_receivers,
@@ -243,6 +252,8 @@ pub(super) async fn process_rg_predicate_only(
         Err(e) => return err_stream(e),
     };
 
+    // Predicate-only means every read column belongs to the predicate. There
+    // is no phase-1/phase-2 split; evaluate each decoded chunk directly.
     // Build schemas + bind predicate once per RG (was ~50µs/chunk overhead).
     let chunk_arrow_schema = schema_from_indices(&ctx.arrow_schema, &plan.pred_col_indices);
     let chunk_daft_schema = match Schema::try_from(chunk_arrow_schema.as_ref()) {
